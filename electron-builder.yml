@@ -1,0 +1,56 @@
+appId: com.thuongtin.moviecast.browser
+productName: Movie Cast Browser
+copyright: Copyright (c) 2026 thuongtin
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+directories:
+  output: release
+files:
+  - dist/**/*
+  - src/main.js
+  - src/preload.js
+  - src/webview-preload.js
+  - package.json
+  - node_modules/**/*
+extraMetadata:
+  main: src/main.js
+asar: true
+mac:
+  icon: build/icons/icon.icns
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+win:
+  icon: build/icons/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+linux:
+  icon: build/icons/icon.png
+  category: AudioVideo
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+    - target: tar.gz
+      arch:
+        - x64

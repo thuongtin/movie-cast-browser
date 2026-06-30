@@ -9,6 +9,7 @@ const files = [
   "tailwind.config.js",
   "postcss.config.js",
   "components.json",
+  "electron-builder.yml",
   "jsconfig.json",
   "src/main.js",
   "src/preload.js",
@@ -24,6 +25,7 @@ const files = [
   "src/components/ui/separator.jsx",
   "src/components/ui/slider.jsx",
   "sample/sample.html",
+  "scripts/generate-icons.js",
   "scripts/ensure-electron.js",
   "README.md",
   "package.json"
