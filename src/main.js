@@ -1,5 +1,8 @@
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
+const http = require("http");
+const os = require("os");
 const { app, BrowserWindow, ipcMain, session, shell } = require("electron");
 const { Bonjour } = require("bonjour-service");
 const { DefaultMediaApp, PersistentClient, ReceiverController, Result } = require("@foxxmd/chromecast-client");
@@ -15,6 +18,13 @@ const MEDIA_EXTENSIONS = [
   ".mkv",
   ".avi",
   ".ogv"
+];
+const SUBTITLE_EXTENSIONS = [
+  ".vtt",
+  ".webvtt",
+  ".srt",
+  ".ttml",
+  ".dfxp"
 ];
 const APP_STATE_FILE = "movie-cast-browser-state.json";
 const HISTORY_LIMIT = 40;
@@ -35,6 +45,11 @@ let castDevices = new Map();
 let currentDeviceId = null;
 let currentCast = null;
 let lastPageUrl = "";
+let subtitleServer = null;
+let subtitleServerBaseUrl = "";
+let subtitleServerPromise = null;
+const preparedSubtitles = new Map();
+const probedHlsManifests = new Set();
 
 function stateFilePath() {
   return path.join(app.getPath("userData"), APP_STATE_FILE);
@@ -44,7 +59,8 @@ function emptyAppState() {
   return {
     lastPageUrl: "",
     history: [],
-    playbackPositions: []
+    playbackPositions: [],
+    appMuted: false
   };
 }
 
@@ -57,7 +73,8 @@ function readAppState() {
       history: Array.isArray(parsed.history) ? parsed.history.filter((item) => isHistoryUrl(item.url)).slice(0, HISTORY_LIMIT) : [],
       playbackPositions: Array.isArray(parsed.playbackPositions)
         ? parsed.playbackPositions.filter((item) => isHistoryUrl(item.url)).slice(0, PLAYBACK_POSITION_LIMIT)
-        : []
+        : [],
+      appMuted: Boolean(parsed.appMuted)
     };
   } catch {
     return emptyAppState();
@@ -68,7 +85,8 @@ function writeAppState(state) {
   const nextState = {
     lastPageUrl: state.lastPageUrl || "",
     history: Array.isArray(state.history) ? state.history.slice(0, HISTORY_LIMIT) : [],
-    playbackPositions: Array.isArray(state.playbackPositions) ? state.playbackPositions.slice(0, PLAYBACK_POSITION_LIMIT) : []
+    playbackPositions: Array.isArray(state.playbackPositions) ? state.playbackPositions.slice(0, PLAYBACK_POSITION_LIMIT) : [],
+    appMuted: Boolean(state.appMuted)
   };
   fs.mkdirSync(path.dirname(stateFilePath()), { recursive: true });
   fs.writeFileSync(stateFilePath(), JSON.stringify(nextState, null, 2));
@@ -91,6 +109,9 @@ function updatePageHistory(payload) {
     return readAppState();
   }
 
+  if (url !== lastPageUrl) {
+    probedHlsManifests.clear();
+  }
   lastPageUrl = url;
   const currentState = readAppState();
   const title = String(payload?.title || "").trim();
@@ -108,17 +129,34 @@ function updatePageHistory(payload) {
   const nextState = writeAppState({
     lastPageUrl: url,
     history,
-    playbackPositions: currentState.playbackPositions
+    playbackPositions: currentState.playbackPositions,
+    appMuted: currentState.appMuted
   });
   sendHistory(nextState.history);
   return nextState;
 }
 
 function clearPageHistory() {
-  const nextState = writeAppState(emptyAppState());
+  const currentState = readAppState();
+  const nextState = writeAppState({
+    ...emptyAppState(),
+    appMuted: currentState.appMuted
+  });
   lastPageUrl = "";
   sendHistory(nextState.history);
   return nextState;
+}
+
+function updateAppMuted(muted) {
+  const currentState = readAppState();
+  const nextState = writeAppState({
+    ...currentState,
+    appMuted: Boolean(muted)
+  });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("app-muted-updated", nextState.appMuted);
+  }
+  return nextState.appMuted;
 }
 
 function sendHistory(history) {
@@ -197,7 +235,18 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = null;
     stopDiscovery();
+    stopSubtitleServer();
   });
+}
+
+function stopSubtitleServer() {
+  if (subtitleServer) {
+    subtitleServer.close();
+  }
+  subtitleServer = null;
+  subtitleServerBaseUrl = "";
+  subtitleServerPromise = null;
+  preparedSubtitles.clear();
 }
 
 function maybeRunSmokeCapture() {
@@ -251,6 +300,15 @@ function attachMediaRequestDetector() {
         score: scoreUrl(media.url, "Network"),
         seenAt: Date.now()
       });
+      probeHlsSubtitles(media.url);
+    }
+    const subtitle = normalizeSubtitleUrl(details.url, "Network");
+    if (subtitle && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("subtitle-candidate", {
+        ...subtitle,
+        pageUrl: lastPageUrl,
+        seenAt: Date.now()
+      });
     }
     callback({});
   });
@@ -288,6 +346,45 @@ function normalizeMediaUrl(rawUrl) {
   };
 }
 
+function normalizeSubtitleUrl(rawUrl, source = "Network") {
+  if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+
+  if (isLikelyAdMediaUrl(parsed)) {
+    return null;
+  }
+
+  const pathname = parsed.pathname.toLowerCase();
+  const extension = SUBTITLE_EXTENSIONS.find((item) => pathname.endsWith(item));
+  if (!extension) {
+    return null;
+  }
+
+  const format = subtitleFormatForUrl(parsed.toString());
+  return {
+    url: parsed.toString(),
+    contentType: subtitleContentTypeForUrl(parsed.toString()),
+    source,
+    label: "",
+    language: "",
+    kind: "subtitles",
+    format,
+    isDefault: false,
+    castSupported: true,
+    requiresConversion: format === "srt",
+    unsupportedReason: "",
+    score: source === "Network" ? 50 : 48
+  };
+}
+
 function isLikelyAdMediaUrl(parsedUrl) {
   const host = parsedUrl.hostname.toLowerCase();
   const pathname = parsedUrl.pathname.toLowerCase();
@@ -307,6 +404,90 @@ function contentTypeForUrl(url) {
   if (clean.endsWith(".mov")) return "video/quicktime";
   if (clean.endsWith(".ogv")) return "video/ogg";
   return "video/mp4";
+}
+
+function subtitleFormatForUrl(url) {
+  const clean = url.split("?")[0].split("#")[0].toLowerCase();
+  if (clean.endsWith(".vtt") || clean.endsWith(".webvtt")) return "webvtt";
+  if (clean.endsWith(".ttml") || clean.endsWith(".dfxp")) return "ttml";
+  if (clean.endsWith(".srt")) return "srt";
+  return "";
+}
+
+function subtitleContentTypeForUrl(url) {
+  const format = subtitleFormatForUrl(url);
+  if (format === "ttml") return "application/ttml+xml";
+  if (format === "srt") return "application/x-subrip";
+  return "text/vtt";
+}
+
+function parseHlsAttributes(line) {
+  const attrs = {};
+  const pattern = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi;
+  let match;
+  while ((match = pattern.exec(line))) {
+    attrs[match[1].toUpperCase()] = String(match[2] || "").replace(/^"|"$/g, "");
+  }
+  return attrs;
+}
+
+function hlsSubtitleCandidates(manifestText, manifestUrl) {
+  return String(manifestText || "")
+    .split(/\r?\n/)
+    .filter((line) => /^#EXT-X-MEDIA/i.test(line) && /TYPE=SUBTITLES/i.test(line))
+    .slice(0, 24)
+    .map((line) => {
+      const attrs = parseHlsAttributes(line);
+      if (!attrs.URI) return null;
+      let url;
+      try {
+        url = new URL(attrs.URI, manifestUrl).toString();
+      } catch {
+        return null;
+      }
+      const format = subtitleFormatForUrl(url) || (url.split("?")[0].toLowerCase().endsWith(".m3u8") ? "hls-vtt" : "");
+      if (!format) return null;
+      return {
+        url,
+        contentType: format === "hls-vtt" ? "application/x-mpegURL" : subtitleContentTypeForUrl(url),
+        source: "HLS",
+        pageUrl: lastPageUrl,
+        label: attrs.NAME || "",
+        language: attrs.LANGUAGE || "",
+        kind: "subtitles",
+        format,
+        isDefault: /^YES$/i.test(attrs.DEFAULT || ""),
+        castSupported: true,
+        requiresConversion: format === "srt",
+        unsupportedReason: "",
+        score: 78,
+        seenAt: Date.now()
+      };
+    })
+    .filter(Boolean);
+}
+
+async function probeHlsSubtitles(url) {
+  if (!url || !url.toLowerCase().includes(".m3u8") || probedHlsManifests.has(url)) return;
+  probedHlsManifests.add(url);
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      headers: {
+        "User-Agent": DEFAULT_USER_AGENT
+      }
+    });
+    if (!response.ok) return;
+    const text = (await response.text()).slice(0, 300000);
+    const subtitles = hlsSubtitleCandidates(text, url);
+    for (const subtitle of subtitles) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("subtitle-candidate", subtitle);
+      }
+    }
+  } catch {
+    // HLS manifests often require page cookies or private headers; skip them.
+  }
 }
 
 function scoreUrl(url, source) {
@@ -393,8 +574,165 @@ function sendCastStatus(status) {
   });
 }
 
-function toChromecastMedia(candidate) {
+function subtitleDisplayName(subtitle) {
+  if (!subtitle) return "";
+  if (subtitle.label) return subtitle.requiresConversion ? `${subtitle.label} (convert)` : subtitle.label;
+  if (subtitle.language) return subtitle.language.toUpperCase();
+  if (subtitle.format === "srt") return "SRT (convert)";
+  if (subtitle.format === "ttml") return "TTML";
+  if (subtitle.format === "hls-vtt") return "HLS Sub";
+  return "WebVTT";
+}
+
+function localLanAddress() {
+  const interfaces = os.networkInterfaces();
+  for (const values of Object.values(interfaces)) {
+    for (const address of values || []) {
+      if (address.family === "IPv4" && !address.internal && !address.address.startsWith("169.254.")) {
+        return address.address;
+      }
+    }
+  }
+  return "";
+}
+
+async function ensureSubtitleServer() {
+  if (subtitleServer && subtitleServerBaseUrl) {
+    return subtitleServerBaseUrl;
+  }
+  if (subtitleServerPromise) {
+    return subtitleServerPromise;
+  }
+
+  const address = localLanAddress();
+  if (!address) {
+    throw new Error("Không tìm thấy IP LAN của máy để TV tải phụ đề.");
+  }
+
+  subtitleServerPromise = new Promise((resolve, reject) => {
+    const server = http.createServer((request, response) => {
+      const id = String(request.url || "").replace(/^\/subtitles\//, "").replace(/\.vtt(?:\?.*)?$/, "");
+      const body = preparedSubtitles.get(id);
+      if (!body) {
+        response.writeHead(404, { "Content-Length": "0" });
+        response.end();
+        return;
+      }
+      const bytes = Buffer.from(body, "utf8");
+      response.writeHead(200, {
+        "Content-Type": "text/vtt; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+        "Content-Length": bytes.length
+      });
+      response.end(bytes);
+    });
+    server.once("error", (error) => {
+      if (subtitleServer === server) {
+        subtitleServer = null;
+        subtitleServerBaseUrl = "";
+        subtitleServerPromise = null;
+      }
+      reject(error);
+    });
+    server.listen(0, "0.0.0.0", () => {
+      subtitleServer = server;
+      subtitleServer.unref();
+      const port = server.address().port;
+      subtitleServerBaseUrl = `http://${address}:${port}`;
+      resolve(subtitleServerBaseUrl);
+    });
+  });
+  return subtitleServerPromise;
+}
+
+function convertSrtToWebVtt(raw) {
+  const blocks = String(raw || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split(/\n{2,}/);
+  const cues = blocks.map((block) => {
+    const lines = block.split("\n").map((line) => line.trimEnd()).filter(Boolean);
+    if (!lines.length) return "";
+    if (/^\d+$/.test(lines[0])) lines.shift();
+    const timeIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timeIndex < 0) return "";
+    const timeLine = lines[timeIndex].replace(/,/g, ".");
+    const text = lines.slice(timeIndex + 1).join("\n");
+    return text ? `${timeLine}\n${text}` : "";
+  }).filter(Boolean);
+
+  if (!cues.length) {
+    throw new Error("SRT không có cue hợp lệ để convert.");
+  }
+  return `WEBVTT\n\n${cues.join("\n\n")}\n`;
+}
+
+async function prepareSubtitleForCast(subtitle) {
+  if (!subtitle?.url || subtitle.castSupported === false) return null;
+  if (!subtitle.requiresConversion) {
+    return {
+      ...subtitle,
+      castUrl: subtitle.url,
+      castContentType: subtitle.contentType || subtitleContentTypeForUrl(subtitle.url),
+      castLabel: subtitleDisplayName(subtitle)
+    };
+  }
+
+  let response;
+  try {
+    response = await fetch(subtitle.url, {
+      redirect: "follow",
+      headers: {
+        "User-Agent": DEFAULT_USER_AGENT
+      }
+    });
+  } catch {
+    throw new Error("Không tải được SRT công khai, có thể URL cần cookie hoặc header riêng.");
+  }
+  if (!response.ok) {
+    throw new Error(`Không tải được SRT công khai, HTTP ${response.status}.`);
+  }
+  const length = Number(response.headers.get("content-length") || 0);
+  if (length > 2 * 1024 * 1024) {
+    throw new Error("File phụ đề quá lớn để convert nhanh.");
+  }
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > 2 * 1024 * 1024) {
+    throw new Error("File phụ đề quá lớn để convert nhanh.");
+  }
+
+  const vtt = convertSrtToWebVtt(text);
+  const id = crypto.createHash("sha256").update(vtt).digest("hex").slice(0, 24);
+  preparedSubtitles.set(id, vtt);
   return {
+    ...subtitle,
+    castUrl: `${await ensureSubtitleServer()}/subtitles/${id}.vtt`,
+    castContentType: "text/vtt",
+    castLabel: subtitle.label || "SRT đã convert"
+  };
+}
+
+async function prepareCandidateForCast(candidate) {
+  const subtitles = Array.isArray(candidate.subtitles) ? candidate.subtitles.slice(0, 1) : [];
+  const prepared = [];
+  for (const subtitle of subtitles) {
+    const result = await prepareSubtitleForCast(subtitle);
+    if (result) prepared.push(result);
+  }
+  return {
+    ...candidate,
+    subtitles: prepared
+  };
+}
+
+function activeTrackIdsFor(candidate) {
+  return Array.isArray(candidate.subtitles) && candidate.subtitles.length ? [1] : [];
+}
+
+function toChromecastMedia(candidate) {
+  const media = {
     contentId: candidate.url,
     contentType: candidate.contentType || contentTypeForUrl(candidate.url),
     streamType: "BUFFERED",
@@ -404,6 +742,19 @@ function toChromecastMedia(candidate) {
       images: candidate.poster ? [{ url: candidate.poster }] : []
     }
   };
+  const tracks = (candidate.subtitles || []).map((subtitle, index) => ({
+    trackId: index + 1,
+    type: "TEXT",
+    trackContentId: subtitle.castUrl || subtitle.url,
+    trackContentType: subtitle.castContentType || subtitle.contentType || subtitleContentTypeForUrl(subtitle.url),
+    name: subtitle.castLabel || subtitleDisplayName(subtitle),
+    language: subtitle.language || "und",
+    subtype: "SUBTITLES"
+  }));
+  if (tracks.length) {
+    media.tracks = tracks;
+  }
+  return media;
 }
 
 function queueItemForCandidate(candidate) {
@@ -411,6 +762,7 @@ function queueItemForCandidate(candidate) {
     url: candidate.url,
     title: candidate.title || "Movie Cast Browser",
     contentType: candidate.contentType || contentTypeForUrl(candidate.url),
+    subtitle: candidate.subtitles?.[0]?.castLabel || candidate.subtitles?.[0]?.label || "",
     addedAt: Date.now()
   };
 }
@@ -669,6 +1021,7 @@ ipcMain.handle("app-info", () => {
     webviewPreloadPath: `file://${path.join(__dirname, "webview-preload.js")}`,
     startPageUrl,
     history: appState.history,
+    appMuted: appState.appMuted,
     userAgent: process.env.MOVIE_CAST_BROWSER_USER_AGENT || DEFAULT_USER_AGENT
   };
 });
@@ -679,6 +1032,10 @@ ipcMain.handle("page-updated", (_event, payload) => {
 
 ipcMain.handle("clear-history", () => {
   return clearPageHistory();
+});
+
+ipcMain.handle("set-app-muted", (_event, muted) => {
+  return updateAppMuted(muted);
 });
 
 ipcMain.handle("open-external", async (_event, url) => {
@@ -708,11 +1065,13 @@ ipcMain.handle("cast-media", async (_event, candidate) => {
 
   const device = selectedDeviceOrThrow();
 
-  const media = toChromecastMedia(candidate);
+  const preparedCandidate = await prepareCandidateForCast(candidate);
+  const media = toChromecastMedia(preparedCandidate);
+  const activeTrackIds = activeTrackIdsFor(preparedCandidate);
   const resumeTime = resumeTimeFor(candidate.url);
   sendCastStatus({
     state: "loading",
-    message: `Sending media to ${device.name}`
+    message: activeTrackIds.length ? `Đang gửi video và phụ đề tới ${device.name}` : `Đang gửi video tới ${device.name}`
   });
 
   if (currentCast) {
@@ -732,7 +1091,8 @@ ipcMain.handle("cast-media", async (_event, candidate) => {
   const loaded = await launched.value.load({
     media,
     autoplay: true,
-    currentTime: resumeTime
+    currentTime: resumeTime,
+    activeTrackIds
   }).then(Result.unwrapWithErr);
 
   if (!loaded.isOk) {
@@ -748,7 +1108,7 @@ ipcMain.handle("cast-media", async (_event, candidate) => {
     receiver,
     device,
     receiverStatus: null,
-    queue: [queueItemForCandidate(candidate)],
+    queue: [queueItemForCandidate(preparedCandidate)],
     playback: null
   };
   currentCast.playback = normalizePlaybackStatus(loaded.value);
@@ -808,19 +1168,22 @@ ipcMain.handle("queue-media", async (_event, candidate) => {
     throw new Error("Missing media URL");
   }
 
-  const media = toChromecastMedia(candidate);
+  const preparedCandidate = await prepareCandidateForCast(candidate);
+  const media = toChromecastMedia(preparedCandidate);
+  const activeTrackIds = activeTrackIdsFor(preparedCandidate);
   const status = unwrapCastResult(await currentCast.mediaApp.queueInsert({
     items: [
       {
         media,
-        autoplay: true
+        autoplay: true,
+        activeTrackIds
       }
     ]
   }), "Could not queue media");
 
   currentCast.queue = [
     ...(currentCast.queue || []),
-    queueItemForCandidate(candidate)
+    queueItemForCandidate(preparedCandidate)
   ];
   currentCast.playback = normalizePlaybackStatus(status);
   rememberPlaybackPosition(currentCast.playback);

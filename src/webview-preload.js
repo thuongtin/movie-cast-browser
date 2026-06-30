@@ -3,7 +3,10 @@ const { ipcRenderer } = require("electron");
 const MEDIA_PATTERN = /\.(m3u8|mpd|mp4|m4v|webm|mov|mkv|avi|ogv)(\?|#|$)/i;
 const MEDIA_URL_PATTERN = /https?:\\?\/\\?\/[^\s"'<>\\]+?\.(?:m3u8|mpd|mp4|m4v|webm|mov|mkv|avi|ogv)(?:[^\s"'<>\\]*)?/gi;
 const MASTER_LINK_PATTERN = /(?:https?:\\?\/\\?\/[^\s"'<>\\]+)?\\?\/player\\?\/master\\?\/[A-Za-z0-9_/-]+/gi;
+const SUBTITLE_PATTERN = /\.(vtt|webvtt|srt|ttml|dfxp)(\?|#|$)/i;
+const SUBTITLE_URL_PATTERN = /https?:\\?\/\\?\/[^\s"'<>\\]+?\.(?:vtt|webvtt|srt|ttml|dfxp)(?:[^\s"'<>\\]*)?/gi;
 const sentCandidates = new Map();
+const sentSubtitles = new Map();
 
 function decodeJsonish(value) {
   return String(value || "")
@@ -42,6 +45,21 @@ function contentTypeForUrl(url) {
   return "video/mp4";
 }
 
+function subtitleFormatForUrl(url) {
+  const clean = url.split("?")[0].split("#")[0].toLowerCase();
+  if (clean.endsWith(".vtt") || clean.endsWith(".webvtt")) return "webvtt";
+  if (clean.endsWith(".ttml") || clean.endsWith(".dfxp")) return "ttml";
+  if (clean.endsWith(".srt")) return "srt";
+  return "";
+}
+
+function subtitleContentTypeForUrl(url) {
+  const format = subtitleFormatForUrl(url);
+  if (format === "ttml") return "application/ttml+xml";
+  if (format === "srt") return "application/x-subrip";
+  return "text/vtt";
+}
+
 function isLikelyAdMediaUrl(url) {
   try {
     const parsed = new URL(url);
@@ -60,6 +78,10 @@ function isLikelyAdMediaUrl(url) {
 function isSupportedMediaUrl(url) {
   const clean = url.split("?")[0].toLowerCase();
   return !isLikelyAdMediaUrl(url) && (MEDIA_PATTERN.test(url) || clean.includes("/player/master/"));
+}
+
+function isSubtitleUrl(url) {
+  return !isLikelyAdMediaUrl(url) && SUBTITLE_PATTERN.test(url);
 }
 
 function defaultScoreFor(source, element) {
@@ -100,21 +122,80 @@ function sendCandidate(url, source, element, details = {}) {
     reason: details.reason || "",
     pageUrl: window.location.href,
     poster: element?.poster || "",
+    subtitles: Array.isArray(details.subtitles) ? details.subtitles : [],
     score,
     seenAt: Date.now()
   });
 }
 
+function sendSubtitle(url, source, details = {}) {
+  const normalized = absoluteUrl(url);
+  if (!normalized || !isSubtitleUrl(normalized)) return;
+
+  const format = subtitleFormatForUrl(normalized);
+  const score = details.score ?? (source === "DOM" ? 80 : source === "Page data" ? 62 : 48);
+  const previousScore = sentSubtitles.get(normalized) || 0;
+  if (previousScore >= score) return;
+  sentSubtitles.set(normalized, score);
+
+  ipcRenderer.sendToHost("subtitle-candidate", {
+    url: normalized,
+    contentType: subtitleContentTypeForUrl(normalized),
+    source,
+    pageUrl: window.location.href,
+    label: details.label || "",
+    language: details.language || "",
+    kind: details.kind || "subtitles",
+    format,
+    isDefault: Boolean(details.isDefault),
+    castSupported: true,
+    requiresConversion: format === "srt",
+    unsupportedReason: "",
+    score,
+    seenAt: Date.now()
+  });
+}
+
+function trackInfo(track) {
+  const normalized = absoluteUrl(track.src || track.getAttribute("src"));
+  if (!normalized || !isSubtitleUrl(normalized)) return null;
+  return {
+    url: normalized,
+    contentType: subtitleContentTypeForUrl(normalized),
+    source: "DOM",
+    pageUrl: window.location.href,
+    label: track.label || track.getAttribute("label") || "",
+    language: track.srclang || track.getAttribute("srclang") || "",
+    kind: track.kind || track.getAttribute("kind") || "subtitles",
+    format: subtitleFormatForUrl(normalized),
+    isDefault: Boolean(track.default),
+    castSupported: true,
+    requiresConversion: subtitleFormatForUrl(normalized) === "srt",
+    unsupportedReason: "",
+    score: track.default ? 88 : 80,
+    seenAt: Date.now()
+  };
+}
+
+function inspectTrackElement(track) {
+  const subtitle = trackInfo(track);
+  if (!subtitle) return null;
+  sendSubtitle(subtitle.url, "DOM", subtitle);
+  return subtitle;
+}
+
 function inspectVideoElement(video) {
-  sendCandidate(video.currentSrc, "DOM", video);
-  sendCandidate(video.src, "DOM", video);
+  const subtitles = Array.from(video.querySelectorAll("track[src]")).map(inspectTrackElement).filter(Boolean);
+  sendCandidate(video.currentSrc, "DOM", video, { subtitles });
+  sendCandidate(video.src, "DOM", video, { subtitles });
   video.querySelectorAll("source[src]").forEach((source) => {
-    sendCandidate(source.src, "DOM", video);
+    sendCandidate(source.src, "DOM", video, { subtitles });
   });
 }
 
 function scanDom() {
   document.querySelectorAll("video").forEach(inspectVideoElement);
+  document.querySelectorAll("track[src]").forEach(inspectTrackElement);
   document.querySelectorAll("a[href], source[src]").forEach((element) => {
     sendCandidate(element.href || element.src, "DOM", null);
   });
@@ -131,6 +212,7 @@ function scanPageData() {
 
   scanStructuredEpisodes(scriptText);
   scanLooseMediaUrls(scriptText);
+  scanLooseSubtitleUrls(scriptText);
 }
 
 function scanStructuredEpisodes(rawText) {
@@ -194,12 +276,26 @@ function scanLooseMediaUrls(rawText) {
   }
 }
 
+function scanLooseSubtitleUrls(rawText) {
+  const text = decodeJsonish(rawText);
+  SUBTITLE_URL_PATTERN.lastIndex = 0;
+  let count = 0;
+  let match;
+  while ((match = SUBTITLE_URL_PATTERN.exec(text)) && count < 40) {
+    sendSubtitle(match[0], "Page data", {
+      score: 62
+    });
+    count += 1;
+  }
+}
+
 function patchNetworkApis() {
   const originalFetch = window.fetch;
   if (typeof originalFetch === "function") {
     window.fetch = function patchedFetch(input, init) {
       const requestUrl = typeof input === "string" ? input : input?.url;
       sendCandidate(requestUrl, "Fetch", null);
+      sendSubtitle(requestUrl, "Fetch");
       return originalFetch.call(this, input, init);
     };
   }
@@ -208,6 +304,7 @@ function patchNetworkApis() {
   if (originalOpen) {
     window.XMLHttpRequest.prototype.open = function patchedOpen(method, url, ...rest) {
       sendCandidate(url, "XHR", null);
+      sendSubtitle(url, "XHR");
       return originalOpen.call(this, method, url, ...rest);
     };
   }
@@ -231,7 +328,7 @@ function installListeners() {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ["src", "href"]
+    attributeFilter: ["src", "href", "label", "srclang"]
   });
 }
 

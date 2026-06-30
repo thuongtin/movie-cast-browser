@@ -43,6 +43,9 @@ const DEFAULT_PLAYBACK = {
   muted: false
 };
 
+const SUBTITLE_AUTO = "__auto__";
+const SUBTITLE_OFF = "__off__";
+
 const CAST_STATE_LABELS = {
   ready: "Sẵn sàng",
   discovering: "Đang quét",
@@ -209,6 +212,20 @@ function uniqueQualityLabels(qualities) {
   return labels;
 }
 
+function subtitleDisplayName(subtitle) {
+  if (!subtitle) return "";
+  if (subtitle.label) return subtitle.requiresConversion ? `${subtitle.label} (convert)` : subtitle.label;
+  if (subtitle.language) return subtitle.language.toUpperCase();
+  if (subtitle.format === "srt") return "SRT (convert)";
+  if (subtitle.format === "ttml") return "TTML";
+  if (subtitle.format === "hls-vtt") return "HLS Sub";
+  return "WebVTT";
+}
+
+function subtitleRank(subtitle) {
+  return (subtitle?.isDefault ? 1000 : 0) + Number(subtitle?.score || 0) + Number(subtitle?.seenAt || 0) / 10000000000000;
+}
+
 const REMEMBERED_DEVICE_KEY = "movieCast.lastDevice";
 
 function readRememberedDevice() {
@@ -245,6 +262,40 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function appMuteJavascript(muted) {
+  const mutedValue = muted ? "true" : "false";
+  return `
+    (() => {
+      window.__movieCastAppMuted = ${mutedValue};
+      const applyMovieCastMute = () => {
+        document.querySelectorAll("video,audio").forEach((media) => {
+          if (window.__movieCastAppMuted) {
+            if (typeof media.__movieCastPreviousVolume !== "number") {
+              media.__movieCastPreviousVolume = media.volume;
+            }
+            media.muted = true;
+            media.volume = 0;
+          } else {
+            media.muted = false;
+            if (typeof media.__movieCastPreviousVolume === "number") {
+              media.volume = media.__movieCastPreviousVolume;
+              delete media.__movieCastPreviousVolume;
+            }
+          }
+        });
+      };
+      applyMovieCastMute();
+      if (!window.__movieCastMuteObserver) {
+        window.__movieCastMuteObserver = new MutationObserver(applyMovieCastMute);
+        window.__movieCastMuteObserver.observe(document.documentElement || document.body, {
+          childList: true,
+          subtree: true
+        });
+      }
+    })();
+  `;
+}
+
 // A sleeping or just-woken TV usually fails the first connection then succeeds
 // once it powers on, so only validation errors are treated as permanent.
 function isRetryableCastError(message) {
@@ -260,12 +311,15 @@ function App() {
   const scanTimerRef = useRef(null);
   const resizingRef = useRef(false);
   const autoSelectedRef = useRef(false);
+  const appMutedRef = useRef(false);
   const [appInfo, setAppInfo] = useState(null);
   const [urlInput, setUrlInput] = useState("");
   const [manualUrl, setManualUrl] = useState("");
   const [history, setHistory] = useState([]);
   const [candidates, setCandidates] = useState(() => new Map());
   const [selectedCandidateUrl, setSelectedCandidateUrl] = useState(null);
+  const [subtitles, setSubtitles] = useState(() => new Map());
+  const [selectedSubtitleUrl, setSelectedSubtitleUrl] = useState(SUBTITLE_AUTO);
   const [devices, setDevices] = useState([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState(null);
   const [status, setStatus] = useState({
@@ -280,6 +334,7 @@ function App() {
   const [mediaInfo, setMediaInfo] = useState(null);
   const [castBusy, setCastBusy] = useState(false);
   const [castAttempt, setCastAttempt] = useState(0);
+  const [appMuted, setAppMuted] = useState(false);
 
   const allCandidates = useMemo(() => {
     return Array.from(candidates.values())
@@ -291,11 +346,39 @@ function App() {
   const recommendedCandidate = visibleCandidates[0] || null;
   const displayedCandidates = recommendedCandidate ? [recommendedCandidate] : [];
   const selectedCandidate = selectedCandidateUrl ? candidates.get(selectedCandidateUrl) || null : null;
+  const visibleSubtitles = useMemo(() => {
+    const merged = [
+      ...(selectedCandidate?.subtitles || []),
+      ...Array.from(subtitles.values())
+    ].filter((subtitle) => subtitle?.url && subtitle.castSupported !== false);
+    const deduped = new Map();
+    for (const subtitle of merged) {
+      const existing = deduped.get(subtitle.url);
+      if (!existing || subtitleRank(subtitle) >= subtitleRank(existing)) {
+        deduped.set(subtitle.url, subtitle);
+      }
+    }
+    return Array.from(deduped.values()).sort((a, b) => subtitleRank(b) - subtitleRank(a)).slice(0, 24);
+  }, [selectedCandidate, subtitles]);
+  const selectedSubtitle = useMemo(() => {
+    if (selectedSubtitleUrl === SUBTITLE_OFF) return null;
+    if (selectedSubtitleUrl === SUBTITLE_AUTO) {
+      return visibleSubtitles.find((subtitle) => subtitle.isDefault) || visibleSubtitles[0] || null;
+    }
+    return visibleSubtitles.find((subtitle) => subtitle.url === selectedSubtitleUrl) || null;
+  }, [selectedSubtitleUrl, visibleSubtitles]);
+  const selectedCandidateForCast = useMemo(() => {
+    if (!selectedCandidate) return null;
+    return {
+      ...selectedCandidate,
+      subtitles: selectedSubtitle ? [selectedSubtitle] : []
+    };
+  }, [selectedCandidate, selectedSubtitle]);
   const hiddenCount = Math.max(0, allCandidates.length - (recommendedCandidate ? 1 : 0));
   const castStateLabel = CAST_STATE_LABELS[status.state] || CAST_STATE_LABELS.ready;
-  const canCast = Boolean(selectedCandidate && selectedDeviceId);
+  const canCast = Boolean(selectedCandidateForCast && selectedDeviceId);
   const canJoinSession = Boolean(selectedDeviceId && !playback.connected);
-  const canQueueSelected = Boolean(selectedCandidate && playback.connected);
+  const canQueueSelected = Boolean(selectedCandidateForCast && playback.connected);
   const selectedDevice = devices.find((device) => device.id === selectedDeviceId || device.selected) || null;
   const sessionDeviceName = playback.deviceName || selectedDevice?.name || "Chưa chọn TV";
   const queueCount = Array.isArray(playback.queue) ? playback.queue.length : 0;
@@ -308,6 +391,10 @@ function App() {
   const navigateTo = useCallback((rawUrl) => {
     const url = normalizeNavigationUrl(rawUrl);
     if (!url) return;
+    setCandidates(new Map());
+    setSelectedCandidateUrl(null);
+    setSubtitles(new Map());
+    setSelectedSubtitleUrl(SUBTITLE_AUTO);
     setUrlInput(url);
     if (webviewRef.current) {
       webviewRef.current.src = url;
@@ -327,6 +414,22 @@ function App() {
       };
       const copy = new Map(previous);
       copy.set(candidate.url, next);
+      return copy;
+    });
+  }, []);
+
+  const addSubtitle = useCallback((subtitle) => {
+    if (!subtitle?.url || subtitle.url.startsWith("blob:") || subtitle.castSupported === false) return;
+    setSubtitles((previous) => {
+      const existing = previous.get(subtitle.url);
+      const next = {
+        ...existing,
+        ...subtitle,
+        score: Math.max(existing?.score || 0, subtitle.score || 0),
+        seenAt: Date.now()
+      };
+      const copy = new Map(previous);
+      copy.set(subtitle.url, next);
       return copy;
     });
   }, []);
@@ -352,12 +455,30 @@ function App() {
     }
   }, [setStatusMessage]);
 
+  const applyAppMutedToWebview = useCallback((muted = appMutedRef.current) => {
+    const webview = webviewRef.current;
+    if (!webview) return;
+    try {
+      webview.setAudioMuted?.(Boolean(muted));
+    } catch {
+      // Ignore webview API gaps; injected media mute below is the fallback.
+    }
+    try {
+      webview.audioMuted = Boolean(muted);
+    } catch {
+      // Best effort for older Electron webview implementations.
+    }
+    webview.executeJavaScript?.(appMuteJavascript(Boolean(muted))).catch(() => {});
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     window.movieCast.getAppInfo().then((info) => {
       if (cancelled) return;
       setAppInfo(info);
       setHistory(Array.isArray(info.history) ? info.history : []);
+      appMutedRef.current = Boolean(info.appMuted);
+      setAppMuted(Boolean(info.appMuted));
     }).catch((error) => {
       setStatusMessage(error.message || "Không khởi động được app.", "error");
     });
@@ -368,9 +489,15 @@ function App() {
 
   useEffect(() => {
     const offCandidates = window.movieCast.onMediaCandidate(addCandidate);
+    const offSubtitles = window.movieCast.onSubtitleCandidate(addSubtitle);
     const offDevices = window.movieCast.onCastDevices(renderDevices);
     const offHistory = window.movieCast.onHistoryUpdated((nextHistory) => {
       setHistory(Array.isArray(nextHistory) ? nextHistory : []);
+    });
+    const offAppMuted = window.movieCast.onAppMutedUpdated((muted) => {
+      appMutedRef.current = muted;
+      setAppMuted(muted);
+      applyAppMutedToWebview(muted);
     });
     const offStatus = window.movieCast.onCastStatus((nextStatus) => {
       setStatus({
@@ -384,11 +511,18 @@ function App() {
 
     return () => {
       offCandidates();
+      offSubtitles();
       offDevices();
       offHistory();
+      offAppMuted();
       offStatus();
     };
-  }, [addCandidate, renderDevices]);
+  }, [addCandidate, addSubtitle, applyAppMutedToWebview, renderDevices]);
+
+  useEffect(() => {
+    appMutedRef.current = appMuted;
+    applyAppMutedToWebview(appMuted);
+  }, [appMuted, applyAppMutedToWebview]);
 
   useEffect(() => {
     const visibleUrls = new Set(displayedCandidates.map((candidate) => candidate.url));
@@ -430,6 +564,12 @@ function App() {
     const handleStop = () => {
       hideLoading();
       updateFromWebview();
+      applyAppMutedToWebview();
+    };
+
+    const handleDomReady = () => {
+      hideLoading();
+      applyAppMutedToWebview();
     };
 
     const handleFail = (event) => {
@@ -457,13 +597,16 @@ function App() {
     };
 
     const handleIpc = (event) => {
-      if (event.channel !== "media-candidate") return;
-      addCandidate(event.args?.[0]);
+      if (event.channel === "media-candidate") {
+        addCandidate(event.args?.[0]);
+      } else if (event.channel === "subtitle-candidate") {
+        addSubtitle(event.args?.[0]);
+      }
     };
 
     webview.addEventListener("did-start-loading", handleStart);
     webview.addEventListener("did-stop-loading", handleStop);
-    webview.addEventListener("dom-ready", hideLoading);
+    webview.addEventListener("dom-ready", handleDomReady);
     webview.addEventListener("did-fail-load", handleFail);
     webview.addEventListener("did-navigate", handleNavigate);
     webview.addEventListener("page-title-updated", handleTitle);
@@ -476,14 +619,14 @@ function App() {
     return () => {
       webview.removeEventListener("did-start-loading", handleStart);
       webview.removeEventListener("did-stop-loading", handleStop);
-      webview.removeEventListener("dom-ready", hideLoading);
+      webview.removeEventListener("dom-ready", handleDomReady);
       webview.removeEventListener("did-fail-load", handleFail);
       webview.removeEventListener("did-navigate", handleNavigate);
       webview.removeEventListener("page-title-updated", handleTitle);
       webview.removeEventListener("ipc-message", handleIpc);
       clearTimeout(loadingTimerRef.current);
     };
-  }, [addCandidate, appInfo, navigateTo, setStatusMessage]);
+  }, [addCandidate, addSubtitle, appInfo, applyAppMutedToWebview, navigateTo, setStatusMessage]);
 
   useEffect(() => {
     if (!playback.connected) return undefined;
@@ -561,7 +704,7 @@ function App() {
   };
 
   const handleCast = async () => {
-    if (!selectedCandidate || castBusy) return;
+    if (!selectedCandidateForCast || castBusy) return;
     const maxAttempts = 4;
     setCastBusy(true);
     try {
@@ -571,7 +714,7 @@ function App() {
           setStatusMessage("Đang gửi video sang TV.", "loading");
         }
         try {
-          await window.movieCast.castMedia(selectedCandidate);
+          await window.movieCast.castMedia(selectedCandidateForCast);
           await refreshPlaybackStatus();
           if (selectedDevice) writeRememberedDevice(selectedDevice);
           return;
@@ -606,9 +749,9 @@ function App() {
   };
 
   const handleQueueSelected = async () => {
-    if (!selectedCandidate) return;
+    if (!selectedCandidateForCast) return;
     try {
-      const result = await window.movieCast.queueMedia(selectedCandidate);
+      const result = await window.movieCast.queueMedia(selectedCandidateForCast);
       setPlayback(result?.playback || DEFAULT_PLAYBACK);
       setStatusMessage("Đã thêm link vào hàng đợi TV.", "casting");
     } catch (error) {
@@ -637,6 +780,8 @@ function App() {
   const handleClearCandidates = () => {
     setCandidates(new Map());
     setSelectedCandidateUrl(null);
+    setSubtitles(new Map());
+    setSelectedSubtitleUrl(SUBTITLE_AUTO);
   };
 
   const handleClearHistory = async () => {
@@ -660,6 +805,25 @@ function App() {
 
   const reload = () => {
     webviewRef.current?.reload?.();
+  };
+
+  const handleToggleAppMuted = async () => {
+    const previousMuted = appMutedRef.current;
+    const nextMuted = !previousMuted;
+    appMutedRef.current = nextMuted;
+    setAppMuted(nextMuted);
+    applyAppMutedToWebview(nextMuted);
+    try {
+      const persistedMuted = await window.movieCast.setAppMuted(nextMuted);
+      appMutedRef.current = Boolean(persistedMuted);
+      setAppMuted(Boolean(persistedMuted));
+      applyAppMutedToWebview(Boolean(persistedMuted));
+    } catch (error) {
+      appMutedRef.current = previousMuted;
+      setAppMuted(previousMuted);
+      applyAppMutedToWebview(previousMuted);
+      setStatusMessage(error.message || "Không lưu được cấu hình âm thanh app.", "error");
+    }
   };
 
   const startResize = (event) => {
@@ -712,6 +876,15 @@ function App() {
             </Button>
             <Button variant="outline" size="icon" title="Tải lại" aria-label="Tải lại" onClick={reload}>
               <RotateCcw className="h-4 w-4" />
+            </Button>
+            <Button
+              variant={appMuted ? "default" : "outline"}
+              size="icon"
+              title={appMuted ? "Bật âm thanh app" : "Tắt âm thanh app"}
+              aria-label={appMuted ? "Bật âm thanh app" : "Tắt âm thanh app"}
+              onClick={handleToggleAppMuted}
+            >
+              {appMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
             </Button>
           </div>
 
@@ -850,6 +1023,12 @@ function App() {
               <p className="filter-note">Đã lọc {hiddenCount} link không chắc chắn hoặc quảng cáo.</p>
             ) : null}
 
+            <SubtitlePicker
+              subtitles={visibleSubtitles}
+              selectedSubtitleUrl={selectedSubtitleUrl}
+              onSelect={setSelectedSubtitleUrl}
+            />
+
             {selectedCandidate ? (
               <MediaPreview candidate={selectedCandidate} info={mediaInfo} onMeta={setMediaInfo} />
             ) : null}
@@ -911,6 +1090,44 @@ function App() {
         </Card>
       </aside>
     </main>
+  );
+}
+
+function SubtitlePicker({ subtitles, selectedSubtitleUrl, onSelect }) {
+  if (!subtitles.length) return null;
+  const activeLabel = selectedSubtitleUrl === SUBTITLE_OFF
+    ? "Tắt"
+    : selectedSubtitleUrl === SUBTITLE_AUTO
+      ? "Tự động"
+      : subtitleDisplayName(subtitles.find((subtitle) => subtitle.url === selectedSubtitleUrl));
+  return (
+    <div className="subtitle-picker">
+      <div className="subtitle-heading">
+        <span>Phụ đề</span>
+        <Badge variant="secondary">{subtitles.length} track</Badge>
+        <span className="subtitle-active">{activeLabel || "Tự động"}</span>
+      </div>
+      <div className="subtitle-options">
+        <Button type="button" size="sm" variant={selectedSubtitleUrl === SUBTITLE_AUTO ? "default" : "outline"} onClick={() => onSelect(SUBTITLE_AUTO)}>
+          Tự động
+        </Button>
+        <Button type="button" size="sm" variant={selectedSubtitleUrl === SUBTITLE_OFF ? "default" : "outline"} onClick={() => onSelect(SUBTITLE_OFF)}>
+          Tắt
+        </Button>
+        {subtitles.map((subtitle) => (
+          <Button
+            type="button"
+            size="sm"
+            variant={selectedSubtitleUrl === subtitle.url ? "default" : "outline"}
+            key={subtitle.url}
+            title={subtitle.url}
+            onClick={() => onSelect(subtitle.url)}
+          >
+            {subtitleDisplayName(subtitle)}
+          </Button>
+        ))}
+      </div>
+    </div>
   );
 }
 

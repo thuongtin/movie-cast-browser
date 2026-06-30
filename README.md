@@ -11,11 +11,13 @@ A small desktop browser that detects direct video URLs inside a web page and cas
 ## Features
 
 - Detects `video` tags and direct media files (`.mp4`, `.m3u8`, `.mpd`, `.webm`) while you browse.
+- Detects standalone subtitle tracks from `<track>`, HLS subtitle groups, and common subtitle URLs.
 - Casts the selected media to a Chromecast on the same LAN, no screen mirroring.
 - Auto scans for devices on launch and remembers the last device you cast to.
 - In app preview of the selected link, including HLS playback through `hls.js`.
 - Shows media duration and resolution when available.
 - TV controls: play, pause, seek, volume, mute, stop, and a media queue.
+- Remembers the app audio mute setting.
 - Resumes playback position per media URL when you cast the same link again.
 - Smart cast handling that retries when a sleeping TV is still waking up.
 
@@ -52,12 +54,14 @@ The selected link shows a preview panel below it. For HLS `.m3u8` links, the app
 ## Advanced casting
 
 - Playback position is saved per media URL and resumed when you cast the same link again.
+- Standalone WebVTT, TTML, and HLS subtitle tracks can be attached to the Cast media request. Public SRT files are converted through a temporary local WebVTT proxy.
 - TV control buttons enable or disable based on the capabilities the Chromecast reports, such as seek, skip, volume, or mute.
 - The queue uses the Default Media Receiver queue API, so it only works when the receiver supports queueing for that media.
 
 ## Technical limits
 
 - The app only casts direct media URLs that the TV can fetch on its own.
+- Detached subtitles only work when the TV can fetch the subtitle URL, or when the desktop app can fetch and proxy a public SRT file.
 - DRM protected video such as Netflix, Disney+, or Prime Video, and streams that require cookies, short lived tokens, or custom headers, usually cannot be cast through the Default Media Receiver.
 - The TV and the computer must be on the same LAN, and the network must allow mDNS.
 - This build focuses on Chromecast. AirPlay and DLNA can be added later as separate adapters.

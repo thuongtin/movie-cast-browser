@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("movieCast", {
   getAppInfo: () => ipcRenderer.invoke("app-info"),
   updatePage: (payload) => ipcRenderer.invoke("page-updated", payload),
   clearHistory: () => ipcRenderer.invoke("clear-history"),
+  setAppMuted: (muted) => ipcRenderer.invoke("set-app-muted", muted),
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
   startDiscovery: () => ipcRenderer.invoke("start-discovery"),
   selectDevice: (deviceId) => ipcRenderer.invoke("select-device", deviceId),
@@ -17,6 +18,11 @@ contextBridge.exposeInMainWorld("movieCast", {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("media-candidate", listener);
     return () => ipcRenderer.removeListener("media-candidate", listener);
+  },
+  onSubtitleCandidate: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("subtitle-candidate", listener);
+    return () => ipcRenderer.removeListener("subtitle-candidate", listener);
   },
   onCastDevices: (callback) => {
     const listener = (_event, payload) => callback(payload);
@@ -32,5 +38,10 @@ contextBridge.exposeInMainWorld("movieCast", {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("history-updated", listener);
     return () => ipcRenderer.removeListener("history-updated", listener);
+  },
+  onAppMutedUpdated: (callback) => {
+    const listener = (_event, payload) => callback(Boolean(payload));
+    ipcRenderer.on("app-muted-updated", listener);
+    return () => ipcRenderer.removeListener("app-muted-updated", listener);
   }
 });

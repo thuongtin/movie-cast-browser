@@ -11,11 +11,13 @@ Trình duyệt desktop nhỏ để phát hiện link video trực tiếp trong t
 ## Tính năng
 
 - Phát hiện thẻ `video` và file media trực tiếp (`.mp4`, `.m3u8`, `.mpd`, `.webm`) khi bạn lướt web.
+- Phát hiện phụ đề rời từ `<track>`, nhóm phụ đề trong HLS, và các URL phụ đề phổ biến.
 - Cast media đã chọn sang Chromecast cùng mạng LAN, không cast màn hình.
 - Tự quét thiết bị khi mở app và ghi nhớ thiết bị cast gần nhất.
 - Preview link đã chọn ngay trong app, gồm cả phát HLS qua `hls.js`.
 - Hiển thị thời lượng và độ phân giải khi có dữ liệu.
 - Điều khiển TV: phát, tạm dừng, tua, âm lượng, tắt tiếng, dừng và hàng đợi media.
+- Ghi nhớ cấu hình tắt tiếng âm thanh của app.
 - Tự resume vị trí xem theo từng media URL khi cast lại cùng link.
 - Xử lý cast thông minh, tự thử lại khi TV đang bật còn chưa sẵn sàng.
 
@@ -52,12 +54,14 @@ Link được chọn có khung preview ngay bên dưới. Với HLS `.m3u8`, app
 ## Cast nâng cao
 
 - App lưu vị trí xem theo media URL và tự resume khi cast lại cùng link.
+- Phụ đề WebVTT, TTML và phụ đề HLS rời có thể được gắn vào Cast media request. File SRT public được chuyển sang WebVTT qua proxy local tạm thời.
 - Các nút điều khiển TV tự bật/tắt theo capability mà Chromecast trả về, ví dụ seek, skip, volume hoặc mute.
 - Hàng đợi dùng queue API của Default Media Receiver nên chỉ hoạt động khi receiver hỗ trợ queue cho media đó.
 
 ## Giới hạn kỹ thuật
 
 - App chỉ cast direct media URL mà TV tự tải được.
+- Phụ đề rời chỉ hoạt động khi TV tự tải được URL phụ đề, hoặc khi desktop app tải được file SRT public và proxy lại dưới dạng WebVTT.
 - Video có DRM như Netflix, Disney+, Prime Video, hoặc stream bắt buộc cookie, token ngắn hạn, header riêng thường sẽ không cast được qua Default Media Receiver.
 - TV và máy tính phải cùng mạng LAN, và mạng phải cho phép mDNS.
 - Bản này tập trung Chromecast. AirPlay và DLNA có thể thêm sau dưới dạng adapter riêng.
