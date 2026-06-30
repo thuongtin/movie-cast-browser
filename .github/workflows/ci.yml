@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Static checks and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        # The Electron binary is not needed for static checks or the renderer
+        # build, so skip its download to keep CI fast and reliable.
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+        run: npm ci
+
+      - name: Run checks and build
+        run: npm run check
+
+# Note: the smoke test (npm run smoke) is intentionally not run in CI. It
+# launches a real Electron window and relies on a display and local network
+# discovery, which are not reliably available on headless CI runners. Run it
+# locally instead.
