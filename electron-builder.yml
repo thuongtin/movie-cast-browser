@@ -44,6 +44,7 @@ nsis:
 linux:
   icon: build/icons/icon.png
   category: AudioVideo
+  maintainer: thuongtin <thuongtin@gmail.com>
   target:
     - target: AppImage
       arch:

@@ -2,7 +2,11 @@
   "name": "movie-cast-browser",
   "version": "0.1.0",
   "description": "A desktop browser that detects direct video URLs and casts media to Chromecast without screen mirroring.",
-  "author": "thuongtin",
+  "author": {
+    "name": "thuongtin",
+    "email": "thuongtin@gmail.com",
+    "url": "https://github.com/thuongtin"
+  },
   "license": "MIT",
   "homepage": "https://github.com/thuongtin/movie-cast-browser#readme",
   "repository": {
@@ -30,10 +34,10 @@
   "scripts": {
     "build": "vite build",
     "icons:generate": "node scripts/generate-icons.js",
-    "dist": "npm run build && electron-builder",
-    "dist:mac": "npm run build && electron-builder --mac",
-    "dist:win": "npm run build && electron-builder --win",
-    "dist:linux": "npm run build && electron-builder --linux",
+    "dist": "npm run build && electron-builder --publish never",
+    "dist:mac": "npm run build && electron-builder --mac --publish never",
+    "dist:win": "npm run build && electron-builder --win --publish never",
+    "dist:linux": "npm run build && electron-builder --linux --publish never",
     "start": "node scripts/ensure-electron.js && npm run build && electron .",
     "check": "node scripts/check.js && npm run build",
     "smoke": "node scripts/ensure-electron.js && npm run build && MOVIE_CAST_BROWSER_SMOKE=1 SMOKE_OUTPUT_DIR=./smoke-output electron .",
