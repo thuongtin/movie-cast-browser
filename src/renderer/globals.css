@@ -806,6 +806,68 @@
     white-space: nowrap;
   }
 
+  .resume-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: grid;
+    place-items: center;
+    background: rgb(0 0 0 / 0.58);
+    padding: 24px;
+    backdrop-filter: blur(8px);
+  }
+
+  .resume-dialog {
+    width: min(440px, 100%);
+    border: 1px solid hsl(var(--border));
+    border-radius: var(--radius-lg);
+    background: hsl(var(--surface));
+    box-shadow: 0 24px 80px rgb(0 0 0 / 0.42);
+    color: hsl(var(--foreground));
+    padding: 20px;
+  }
+
+  .resume-eyebrow {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid hsl(var(--primary) / 0.34);
+    border-radius: 999px;
+    background: hsl(var(--primary) / 0.12);
+    color: hsl(var(--primary));
+    font-size: var(--text-xs);
+    font-weight: 700;
+    padding: 3px 9px;
+  }
+
+  .resume-dialog h2 {
+    margin: 14px 0 0;
+    font-size: var(--text-xl);
+    font-weight: 800;
+  }
+
+  .resume-title {
+    margin: 8px 0 0;
+    overflow: hidden;
+    font-size: var(--text-sm);
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .resume-copy {
+    margin: 8px 0 0;
+    color: hsl(var(--muted-foreground));
+    font-size: var(--text-sm);
+    line-height: 1.5;
+  }
+
+  .resume-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 18px;
+  }
+
   .tv-transport {
     display: flex;
     align-items: center;
@@ -845,6 +907,10 @@
     .app-shell {
       grid-template-columns: minmax(0, 1fr) 12px var(--panel-width, 332px);
       padding: 10px;
+    }
+
+    .resume-actions {
+      grid-template-columns: 1fr;
     }
   }
 }

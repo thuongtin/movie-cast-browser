@@ -29,6 +29,7 @@ const SUBTITLE_EXTENSIONS = [
 const APP_STATE_FILE = "movie-cast-browser-state.json";
 const HISTORY_LIMIT = 40;
 const PLAYBACK_POSITION_LIMIT = 100;
+const PLAYBACK_STATUS_TIMEOUT_MS = 5000;
 const MEDIA_COMMANDS = {
   pause: 1,
   seek: 2,
@@ -178,14 +179,19 @@ function playbackPositionFor(url) {
   return appState.playbackPositions.find((item) => item.url === url) || null;
 }
 
-function resumeTimeFor(url) {
+function resumePositionFor(url) {
   const position = playbackPositionFor(url);
-  if (!position) return 0;
+  if (!position) return null;
   const currentTime = Number(position.currentTime || 0);
   const duration = Number(position.duration || 0);
-  if (currentTime < 5) return 0;
-  if (duration > 0 && currentTime > duration - 20) return 0;
-  return currentTime;
+  if (currentTime < 5) return null;
+  if (duration > 0 && currentTime > duration - 20) return null;
+  return {
+    ...position,
+    currentTime,
+    duration,
+    updatedAt: Number(position.updatedAt || 0)
+  };
 }
 
 function rememberPlaybackPosition(playback = getCachedPlaybackStatus()) {
@@ -282,7 +288,7 @@ function maybeRunSmokeCapture() {
       fs.writeFileSync(path.join(outputDir, "smoke-error.txt"), error.stack || error.message);
       process.exitCode = 1;
     } finally {
-      app.quit();
+      app.exit(process.exitCode || 0);
     }
   }, waitMs);
 }
@@ -848,33 +854,61 @@ function unwrapCastResult(result, fallbackMessage) {
   return unwrapped.value;
 }
 
+function withTimeout(promise, timeoutMs, message) {
+  let timeoutId;
+  const timeout = new Promise((_resolve, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
 async function refreshPlaybackStatus() {
   if (!currentCast) {
     return getCachedPlaybackStatus();
   }
 
-  const status = unwrapCastResult(await currentCast.mediaApp.getStatus(), "Could not read media status");
-  let volume = currentCast.playback;
-  if (currentCast.receiver) {
-    try {
-      volume = unwrapCastResult(await currentCast.receiver.getVolume(), "Could not read volume");
-    } catch {
-      volume = currentCast.playback;
+  try {
+    const status = unwrapCastResult(
+      await withTimeout(currentCast.mediaApp.getStatus(), PLAYBACK_STATUS_TIMEOUT_MS, "Timed out reading media status from TV"),
+      "Could not read media status"
+    );
+    let volume = currentCast.playback;
+    if (currentCast.receiver) {
+      try {
+        volume = unwrapCastResult(
+          await withTimeout(currentCast.receiver.getVolume(), PLAYBACK_STATUS_TIMEOUT_MS, "Timed out reading TV volume"),
+          "Could not read volume"
+        );
+      } catch {
+        volume = currentCast.playback;
+      }
+      try {
+        currentCast.receiverStatus = unwrapCastResult(
+          await withTimeout(currentCast.receiver.getStatus(), PLAYBACK_STATUS_TIMEOUT_MS, "Timed out reading receiver status"),
+          "Could not read receiver status"
+        );
+      } catch {
+        currentCast.receiverStatus = currentCast.receiverStatus || null;
+      }
     }
-    try {
-      currentCast.receiverStatus = unwrapCastResult(await currentCast.receiver.getStatus(), "Could not read receiver status");
-    } catch {
-      currentCast.receiverStatus = currentCast.receiverStatus || null;
-    }
-  }
 
-  currentCast.playback = normalizePlaybackStatus(status, volume);
-  rememberPlaybackPosition(currentCast.playback);
-  sendCastStatus({
-    state: currentCast.playback.playerState === "PLAYING" ? "casting" : "ready",
-    message: `Playback ${currentCast.playback.playerState.toLowerCase()}`
-  });
-  return currentCast.playback;
+    currentCast.playback = {
+      ...normalizePlaybackStatus(status, volume),
+      updatedAt: Date.now()
+    };
+    rememberPlaybackPosition(currentCast.playback);
+    sendCastStatus({
+      state: currentCast.playback.playerState === "PLAYING" ? "casting" : "ready",
+      message: `Playback ${currentCast.playback.playerState.toLowerCase()}`
+    });
+    return currentCast.playback;
+  } catch (error) {
+    sendCastStatus({
+      state: "error",
+      message: error.message || "Không đồng bộ được thời gian thực tế từ TV."
+    });
+    throw error;
+  }
 }
 
 async function closeCurrentCast() {
@@ -1054,7 +1088,25 @@ ipcMain.handle("select-device", (_event, deviceId) => {
   return true;
 });
 
-ipcMain.handle("cast-media", async (_event, candidate) => {
+ipcMain.handle("playback-position", (_event, url) => {
+  return resumePositionFor(url);
+});
+
+function normalizeCastRequest(input) {
+  if (input?.candidate) {
+    return {
+      candidate: input.candidate,
+      startTime: Math.max(0, Number(input.startTime || 0))
+    };
+  }
+  return {
+    candidate: input,
+    startTime: 0
+  };
+}
+
+ipcMain.handle("cast-media", async (_event, input) => {
+  const { candidate, startTime } = normalizeCastRequest(input);
   if (!candidate?.url) {
     throw new Error("Missing media URL");
   }
@@ -1068,7 +1120,7 @@ ipcMain.handle("cast-media", async (_event, candidate) => {
   const preparedCandidate = await prepareCandidateForCast(candidate);
   const media = toChromecastMedia(preparedCandidate);
   const activeTrackIds = activeTrackIdsFor(preparedCandidate);
-  const resumeTime = resumeTimeFor(candidate.url);
+  const resumeTime = startTime;
   sendCastStatus({
     state: "loading",
     message: activeTrackIds.length ? `Đang gửi video và phụ đề tới ${device.name}` : `Đang gửi video tới ${device.name}`
@@ -1111,7 +1163,10 @@ ipcMain.handle("cast-media", async (_event, candidate) => {
     queue: [queueItemForCandidate(preparedCandidate)],
     playback: null
   };
-  currentCast.playback = normalizePlaybackStatus(loaded.value);
+  currentCast.playback = {
+    ...normalizePlaybackStatus(loaded.value),
+    updatedAt: Date.now()
+  };
 
   sendCastStatus({
     state: "casting",

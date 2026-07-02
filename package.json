@@ -1,6 +1,6 @@
 {
   "name": "movie-cast-browser",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A desktop browser that detects direct video URLs and casts media to Chromecast without screen mirroring.",
   "author": {
     "name": "thuongtin",

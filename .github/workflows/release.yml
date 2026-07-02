@@ -92,6 +92,9 @@ jobs:
           - Preview detected links in app
           - Control TV playback, seek, volume, mute, stop, and queue
           - Detect and cast detached subtitles when the TV can fetch them
+          - Sync controls from real TV playback status
+          - Ask whether to restart or continue when casting an old link
+          - Fix blank Electron window caused by early webview script injection
           EOF
 
       - name: Publish GitHub release

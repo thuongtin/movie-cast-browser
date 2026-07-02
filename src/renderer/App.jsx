@@ -55,6 +55,8 @@ const CAST_STATE_LABELS = {
   error: "Lỗi"
 };
 
+const CAST_STATUS_POLL_MS = 1000;
+
 function normalizeNavigationUrl(rawValue) {
   const value = String(rawValue || "").trim();
   if (!value) return "";
@@ -262,6 +264,21 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isResumablePosition(position) {
+  const currentTime = Number(position?.currentTime || 0);
+  const duration = Number(position?.duration || 0);
+  if (currentTime < 5) return false;
+  if (duration > 0 && currentTime > duration - 20) return false;
+  return true;
+}
+
+function resumableCurrentTime(position) {
+  const currentTime = Number(position?.currentTime || 0);
+  const duration = Number(position?.duration || 0);
+  if (!isResumablePosition(position)) return 0;
+  return duration > 0 ? clampNumber(currentTime, 0, duration) : currentTime;
+}
+
 function appMuteJavascript(muted) {
   const mutedValue = muted ? "true" : "false";
   return `
@@ -307,6 +324,7 @@ function isRetryableCastError(message) {
 
 function App() {
   const webviewRef = useRef(null);
+  const webviewDomReadyRef = useRef(false);
   const loadingTimerRef = useRef(null);
   const scanTimerRef = useRef(null);
   const resizingRef = useRef(false);
@@ -335,6 +353,7 @@ function App() {
   const [castBusy, setCastBusy] = useState(false);
   const [castAttempt, setCastAttempt] = useState(0);
   const [appMuted, setAppMuted] = useState(false);
+  const [resumePrompt, setResumePrompt] = useState(null);
 
   const allCandidates = useMemo(() => {
     return Array.from(candidates.values())
@@ -468,7 +487,12 @@ function App() {
     } catch {
       // Best effort for older Electron webview implementations.
     }
-    webview.executeJavaScript?.(appMuteJavascript(Boolean(muted))).catch(() => {});
+    if (!webviewDomReadyRef.current || typeof webview.executeJavaScript !== "function") return;
+    try {
+      webview.executeJavaScript(appMuteJavascript(Boolean(muted))).catch(() => {});
+    } catch {
+      // Electron throws synchronously if the webview is not ready for script execution.
+    }
   }, []);
 
   useEffect(() => {
@@ -554,6 +578,7 @@ function App() {
     };
 
     const handleStart = () => {
+      webviewDomReadyRef.current = false;
       setLoadingPage(true);
       clearTimeout(loadingTimerRef.current);
       loadingTimerRef.current = setTimeout(() => {
@@ -568,6 +593,7 @@ function App() {
     };
 
     const handleDomReady = () => {
+      webviewDomReadyRef.current = true;
       hideLoading();
       applyAppMutedToWebview();
     };
@@ -624,6 +650,7 @@ function App() {
       webview.removeEventListener("did-navigate", handleNavigate);
       webview.removeEventListener("page-title-updated", handleTitle);
       webview.removeEventListener("ipc-message", handleIpc);
+      webviewDomReadyRef.current = false;
       clearTimeout(loadingTimerRef.current);
     };
   }, [addCandidate, addSubtitle, appInfo, applyAppMutedToWebview, navigateTo, setStatusMessage]);
@@ -632,7 +659,7 @@ function App() {
     if (!playback.connected) return undefined;
     const interval = setInterval(() => {
       refreshPlaybackStatus();
-    }, 5000);
+    }, CAST_STATUS_POLL_MS);
     return () => clearInterval(interval);
   }, [playback.connected, refreshPlaybackStatus]);
 
@@ -703,8 +730,33 @@ function App() {
     }
   };
 
+  const chooseCastStartTime = useCallback(async (candidate) => {
+    let savedPosition = null;
+    try {
+      savedPosition = await window.movieCast.getPlaybackPosition(candidate.url);
+    } catch (error) {
+      setStatusMessage(error.message || "Không đọc được vị trí xem đã lưu.", "error");
+    }
+    if (!isResumablePosition(savedPosition)) return 0;
+    return new Promise((resolve) => {
+      setResumePrompt({
+        candidate,
+        position: savedPosition,
+        onStartOver: () => {
+          setResumePrompt(null);
+          resolve(0);
+        },
+        onContinue: () => {
+          setResumePrompt(null);
+          resolve(Number(savedPosition.currentTime || 0));
+        }
+      });
+    });
+  }, [setStatusMessage]);
+
   const handleCast = async () => {
     if (!selectedCandidateForCast || castBusy) return;
+    const startTime = await chooseCastStartTime(selectedCandidateForCast);
     const maxAttempts = 4;
     setCastBusy(true);
     try {
@@ -714,7 +766,10 @@ function App() {
           setStatusMessage("Đang gửi video sang TV.", "loading");
         }
         try {
-          await window.movieCast.castMedia(selectedCandidateForCast);
+          await window.movieCast.castMedia({
+            candidate: selectedCandidateForCast,
+            startTime
+          });
           await refreshPlaybackStatus();
           if (selectedDevice) writeRememberedDevice(selectedDevice);
           return;
@@ -1089,6 +1144,7 @@ function App() {
           </CardContent>
         </Card>
       </aside>
+      {resumePrompt ? <ResumePrompt prompt={resumePrompt} /> : null}
     </main>
   );
 }
@@ -1126,6 +1182,38 @@ function SubtitlePicker({ subtitles, selectedSubtitleUrl, onSelect }) {
             {subtitleDisplayName(subtitle)}
           </Button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function ResumePrompt({ prompt }) {
+  const startTime = resumableCurrentTime(prompt.position);
+  const title = prompt.position?.title || safeTitle(prompt.candidate);
+  const duration = Number(prompt.position?.duration || 0);
+  const progressText = duration > 0
+    ? `${formatSeconds(startTime)} / ${formatSeconds(duration)}`
+    : formatSeconds(startTime);
+
+  return (
+    <div className="resume-overlay" role="presentation">
+      <div className="resume-dialog" role="dialog" aria-modal="true" aria-labelledby="resume-title">
+        <span className="resume-eyebrow">Cast lại link cũ</span>
+        <h2 id="resume-title">Tiếp tục xem?</h2>
+        <p className="resume-title">{title}</p>
+        <p className="resume-copy">
+          App đã lưu vị trí dừng ở {progressText}. Chọn cách phát trước khi gửi video lên TV.
+        </p>
+        <div className="resume-actions">
+          <Button type="button" variant="outline" onClick={prompt.onStartOver}>
+            <RotateCcw className="h-4 w-4" />
+            Phát từ đầu
+          </Button>
+          <Button type="button" onClick={prompt.onContinue}>
+            <Play className="h-4 w-4" />
+            Tiếp tục
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -1390,8 +1478,9 @@ function TvControls({ playback, onControl, onRefresh }) {
   const connected = Boolean(playback?.connected);
   const playing = playback?.playerState === "PLAYING";
   const duration = Number(playback?.duration || 0);
-  const currentTime = Number(playback?.currentTime || 0);
-  const currentPosition = duration > 0 ? clampNumber(currentTime, 0, duration) : 0;
+  const baseCurrentTime = Number(playback?.currentTime || 0);
+  const syncTime = Number(playback?.updatedAt || Date.now());
+  const playbackRate = Number(playback?.playbackRate || 1);
   const receivedVolumeLevel = typeof playback?.volumeLevel === "number" ? Math.round(playback.volumeLevel * 100) : 50;
   const commandMask = Number(playback?.supportedMediaCommands || 0);
   const commandSupport = playback?.commands || {};
@@ -1404,10 +1493,22 @@ function TvControls({ playback, onControl, onRefresh }) {
   const canMute = connected && (!hasCommandMask || Boolean(commandSupport.streamMute));
   const queueCount = Array.isArray(playback?.queue) ? playback.queue.length : 0;
   const appText = playback?.activeAppName ? ` - ${playback.activeAppName}` : "";
+  const [positionTick, setPositionTick] = useState(Date.now());
+  const elapsed = playing && syncTime > 0 ? Math.max(0, (positionTick - syncTime) / 1000) * playbackRate : 0;
+  const currentPosition = duration > 0 ? clampNumber(baseCurrentTime + elapsed, 0, duration) : 0;
   const [seekValue, setSeekValue] = useState(currentPosition);
   const [volumeValue, setVolumeValue] = useState(receivedVolumeLevel);
   const [seekEditing, setSeekEditing] = useState(false);
   const [volumeEditing, setVolumeEditing] = useState(false);
+
+  useEffect(() => {
+    if (!connected || !playing || seekEditing) {
+      setPositionTick(Date.now());
+      return undefined;
+    }
+    const interval = setInterval(() => setPositionTick(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [connected, playing, seekEditing, baseCurrentTime, syncTime]);
 
   useEffect(() => {
     if (!seekEditing) {
